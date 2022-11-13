@@ -217,5 +217,6 @@ if __name__ == "__main__":
     
     opt.imgsz = (opt.imgse, opt.imgsz)  # expand
     check_requirements(exclude=('tensorboard', 'thop'))
+    save_img = Fasle
     
-    run(opt)
+    run(opt, save_img)
