@@ -30,7 +30,7 @@ def get_detection_folder():
 
 if __name__ == '__main__':
 
-    st.title('YOLOv5 Peach Detection App')
+    st.title('桃子检测器')
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str,
