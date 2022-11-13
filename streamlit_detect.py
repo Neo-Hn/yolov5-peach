@@ -52,7 +52,7 @@ def run(opt, save_img=False):
     weights, source, imgsz, conf_thres, iou_thres, view_img, save_txt, name = opt.weights, opt.source, opt.imgsz, opt.conf_thres, opt.iou_thres, opt.view_img, opt.save_txt, opt.name
     data = 'data/peach.yaml'
     dnn, half, vid_stride, visualize, classes = False, False, 1, False, None
-    augment, update, max_det, save_crop, save_conf, agnostic_nms = opt.augment, opt.update, opt.max_det, opt.save_crop, opt.save_conf, opt.agnostic_nms
+    augment, update, max_det, save_crop, save_conf, agnostic_nms = opt.augment, opt.update, 1000, opt.save_crop, opt.save_conf, opt.agnostic_nms
     
     source = str(source)
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
