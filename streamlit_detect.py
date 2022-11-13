@@ -59,24 +59,24 @@ def run(opt, save_img=False):
         source = check_file(source)  # download
 
     # Directories
-    save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
+    save_dir = increment_path(Path(opt.project) / name, exist_ok=opt.exist_ok)  # increment run
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
     # Load model
-    device = select_device(device)
-    model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
+    device = select_device(opt.device)
+    model = DetectMultiBackend(weights, device=device, dnn=opt.dnn, data=data, fp16=opt.half)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
-
-    # Dataloader
+    
+    bs = 1  # batch_size
     if webcam:
-        view_img = check_imshow()
-        cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
-        bs = len(dataset)  # batch_size
+        view_img = check_imshow(warn=True)
+        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=opt.vid_stride)
+        bs = len(dataset)
+    elif screenshot:
+        dataset = LoadScreenshots(source, img_size=imgsz, stride=stride, auto=pt)
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
-        bs = 1  # batch_size
+        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
@@ -137,7 +137,7 @@ def run(opt, save_img=False):
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                        label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
                         # annotator.box_label(xyxy, label, color=colors(c, True))
                         # 画圆框
                         annotator.plot_box_or_ellipse(xyxy, label, color=colors(c, True))
