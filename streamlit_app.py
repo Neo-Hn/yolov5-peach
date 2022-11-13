@@ -2,7 +2,7 @@ from io import StringIO
 from pathlib import Path
 import streamlit as st
 import time
-from detect import main
+from streamlit_detect import main
 import os
 import sys
 import argparse
@@ -37,7 +37,7 @@ if __name__ == '__main__':
                         default='weights/yolov5s-C3SE.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str,
                         default='data/images', help='source')
-    parser.add_argument('--img-size', type=int, default=640,
+    parser.add_argument('--imgsz', type=int, default=640,
                         help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float,
                         default=0.35, help='object confidence threshold')
@@ -102,7 +102,7 @@ if __name__ == '__main__':
         print('valid')
         if st.button('开始检测'):
 
-            main(opt)
+            main(**vars(opt))
 
             if source_index == 0:
                 with st.spinner(text='Preparing Images'):
