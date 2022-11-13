@@ -49,7 +49,7 @@ from utils.torch_utils import select_device, smart_inference_mode
 
 @smart_inference_mode()
 def run(opt, save_img=False):
-    weights, source, imgsz, conf_thres, iou_thres, view_img, save_txt, name = opt.weights, opt.source, opt.imgsz, opt.conf_thres, opt.iou_thres, opt.view_img, False, opt.name
+    weights, source, imgsz, conf_thres, iou_thres, view_img, save_txt, name = opt.weights, opt.source, [640, 640], opt.conf_thres, opt.iou_thres, opt.view_img, False, opt.name
     data = 'data/peach.yaml'
     dnn, half, vid_stride, visualize, classes = False, False, 1, False, None
     augment, update, max_det, save_crop, save_conf, agnostic_nms = opt.augment, False, 1000, False, False, False
@@ -88,7 +88,7 @@ def run(opt, save_img=False):
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
-    model.warmup(imgsz=(1 if pt else bs, 3, *[640, 640]))  # warmup
+    model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
