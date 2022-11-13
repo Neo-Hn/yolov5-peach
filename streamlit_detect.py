@@ -51,7 +51,7 @@ from utils.torch_utils import select_device, smart_inference_mode
 def run(opt, save_img=False):
     weights, source, imgsz, conf_thres, iou_thres, view_img, save_txt = opt.weights, opt.source, opt.imgsz, opt.conf_thres, opt.iou_thres, opt.view_img, opt.save_txt
     source = str(source)
-    save_img = not nosave and not source.endswith('.txt')  # save inference images
+    save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(('rtsp://', 'rtmp://', 'http://', 'https://'))
     webcam = source.isnumeric() or source.endswith('.txt') or (is_url and not is_file)
