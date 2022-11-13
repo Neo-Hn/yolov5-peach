@@ -217,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
 
     opt = parser.parse_args()
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     
     opt.imgsz = (opt.imgse, opt.imgsz)  # expand
     check_requirements(exclude=('tensorboard', 'thop'))
