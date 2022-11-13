@@ -102,7 +102,7 @@ if __name__ == '__main__':
         print('valid')
         if st.button('开始检测'):
 
-            run(opt)
+            run(opt, False)
 
             if source_index == 0:
                 with st.spinner(text='Preparing Images'):
