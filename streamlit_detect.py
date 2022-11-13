@@ -54,6 +54,8 @@ def run(opt, save_img=False):
     dnn, half, vid_stride, visualize, classes = False, False, 1, False, None
     augment, update, max_det, save_crop, save_conf, agnostic_nms = opt.augment, False, 1000, False, False, False
     line_thickness=3
+    hide_labels=False
+    hide_conf=False
     
     source = str(source)
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
