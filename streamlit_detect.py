@@ -241,7 +241,7 @@ if __name__ == "__main__":
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     opt = parser.parse_args()
     
-    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
+    opt.imgsz = (640, 640)  # expand
     check_requirements(exclude=('tensorboard', 'thop'))
     
     run(**vars(opt))
