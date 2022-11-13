@@ -145,7 +145,7 @@ def run(opt, save_img=False):
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
+                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
                         # annotator.box_label(xyxy, label, color=colors(c, True))
                         # 画圆框
                         annotator.plot_box_or_ellipse(xyxy, label, color=colors(c, True))
