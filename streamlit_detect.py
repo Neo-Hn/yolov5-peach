@@ -49,7 +49,7 @@ from utils.torch_utils import select_device, smart_inference_mode
 
 @smart_inference_mode()
 def run(opt, save_img=False):
-    weights, source, imgsz, conf_thres, iou_thres, view_img, save_txt = opt.weights, opt.source, opt.imgsz, opt.conf_thres, opt.iou_thres, opt.view_img, opt.save_txt
+    weights, source, imgsz, conf_thres, iou_thres, view_img, save_txt, name = opt.weights, opt.source, opt.imgsz, opt.conf_thres, opt.iou_thres, opt.view_img, opt.save_txt, opt.name
     source = str(source)
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
