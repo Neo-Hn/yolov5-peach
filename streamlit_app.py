@@ -2,7 +2,7 @@ from io import StringIO
 from pathlib import Path
 import streamlit as st
 import time
-from streamlit_detect import main
+from streamlit_detect import run
 import os
 import sys
 import argparse
@@ -102,7 +102,7 @@ if __name__ == '__main__':
         print('valid')
         if st.button('开始检测'):
 
-            main(**vars(opt))
+            run(**vars(opt))
 
             if source_index == 0:
                 with st.spinner(text='Preparing Images'):
