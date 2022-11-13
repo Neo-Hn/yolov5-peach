@@ -1,8 +1,3 @@
-# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
-"""
-Common modules
-"""
-
 import ast
 import contextlib
 import json
@@ -32,7 +27,6 @@ from utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suff
                            xyxy2xywh, yaml_load)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, smart_inference_mode
-
 
 def autopad(k, p=None):  # kernel, padding
     # Pad to 'same'
