@@ -193,7 +193,7 @@ if __name__ == "__main__":
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path(s)')
     parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--data', type=str, default=ROOT / 'data/peach.yaml', help='(optional) dataset.yaml path')
-    parser.add_argument('--imgsz', nargs='+', type=int, default=[640], help='inference size h,w')
+    parser.add_argument('--imgsz', nargs='+', type=int, default=[640, 640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IoU threshold')
     parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
@@ -217,9 +217,7 @@ if __name__ == "__main__":
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
 
     opt = parser.parse_args()
-    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
-    
-    opt.imgsz = (opt.imgse, opt.imgsz)  # expand
+
     check_requirements(exclude=('tensorboard', 'thop'))
     save_img = Fasle
     
