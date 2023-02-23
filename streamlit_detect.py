@@ -151,6 +151,9 @@ def run(opt, save_img=False):
                         annotator.plot_box_or_ellipse(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+                        
+            # 统计检测出的目标数量
+            annotator.count_nums(len(det), txt_color=(0, 0, 255))
 
             # Stream results
             im0 = annotator.result()
