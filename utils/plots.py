@@ -197,6 +197,12 @@ class Annotator:
     def result(self):
         # Return annotated image as array
         return np.asarray(self.im)
+      
+    # 在检测图上写上检测到的目标数量
+    def count_nums(self, nums: int, txt_color=(255, 255, 255)):
+        tf = max(self.lw - 1, 1)  # font thickness
+        # w, h = cv2.getTextSize(f'count:{nums}', 0, fontScale=self.lw / 3, thickness=tf)[0]  # text width, height
+        cv2.putText(self.im, f'count:{nums}', (5, 30), 0, self.lw / 3, txt_color, thickness=tf, lineType=cv2.LINE_AA)
 
 
 def feature_visualization(x, module_type, stage, n=32, save_dir=Path('runs/detect/exp')):
