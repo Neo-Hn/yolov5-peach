@@ -15,4 +15,4 @@ test:  # test images (optional)
 
 # Classes
 names:
-  0: peach
+  0: orange
