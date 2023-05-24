@@ -14,6 +14,9 @@ from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
 from urllib.parse import urlparse
+from torch.nn.parameter import Parameter
+import torch.nn.functional as F
+
 
 import cv2
 import numpy as np
@@ -694,7 +697,7 @@ class AutoShape(nn.Module):
                 g = max(size) / max(s)  # gain
                 shape1.append([int(y * g) for y in s])
                 ims[i] = im if im.data.contiguous else np.ascontiguousarray(im)  # update
-            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)] if self.pt else size  # inf shape
+            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)]  # inf shape
             x = [letterbox(im, shape1, auto=False)[0] for im in ims]  # pad
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
@@ -858,9 +861,392 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
-      
-"""    C3SE Start    """
-# C3SE: Conv -> Conv -> SE -> add
+    
+    
+""" 注意力机制开始 """
+# SE注意力机制
+class SE(nn.Module):
+    def __init__(self, c1, c2, ratio=16):
+        super(SE, self).__init__()
+        #c*1*1
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.l1 = nn.Linear(c1, c1 // ratio, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.l2 = nn.Linear(c1 // ratio, c1, bias=False)
+        self.sig = nn.Sigmoid()
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avgpool(x).view(b, c)
+        y = self.l1(y)
+        y = self.relu(y)
+        y = self.l2(y)
+        y = self.sig(y)
+        y = y.view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+# CBAM注意力机制
+class ChannelAttention(nn.Module):
+    def __init__(self,channel,reduction=16):
+        super().__init__()
+        self.maxpool=nn.AdaptiveMaxPool2d(1)
+        self.avgpool=nn.AdaptiveAvgPool2d(1)
+        self.se=nn.Sequential(
+            nn.Conv2d(channel,channel//reduction,1,bias=False),
+            nn.ReLU(),
+            nn.Conv2d(channel//reduction,channel,1,bias=False)
+        )
+        self.sigmoid=nn.Sigmoid()
+    
+    def forward(self, x) :
+        max_result=self.maxpool(x)
+        avg_result=self.avgpool(x)
+        max_out=self.se(max_result)
+        avg_out=self.se(avg_result)
+        output=self.sigmoid(max_out+avg_out)
+        return output
+
+class SpatialAttention(nn.Module):
+    def __init__(self,kernel_size=7):
+        super().__init__()
+        self.conv=nn.Conv2d(2,1,kernel_size=kernel_size,padding=kernel_size//2)
+        self.sigmoid=nn.Sigmoid()
+    
+    def forward(self, x) :
+        max_result,_=torch.max(x,dim=1,keepdim=True)
+        avg_result=torch.mean(x,dim=1,keepdim=True)
+        result=torch.cat([max_result,avg_result],1)
+        output=self.conv(result)
+        output=self.sigmoid(output)
+        return output
+
+
+class CBAM(nn.Module):
+
+    def __init__(self, channel=512,reduction=16,kernel_size=7):
+        super().__init__()
+        self.ca=ChannelAttention(channel=channel,reduction=reduction)
+        self.sa=SpatialAttention(kernel_size=kernel_size)
+
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        residual=x
+        out=x*self.ca(x)
+        out=out*self.sa(out)
+        return out+residual
+    
+# ECA注意力机制
+class ECA(nn.Module):
+    """Constructs a ECA module.
+    Args:
+        channel: Number of channels of the input feature map
+        k_size: Adaptive selection of kernel size
+    """
+
+    def __init__(self, c1,c2, k_size=3):
+        super(ECA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # feature descriptor on the global spatial information
+        y = self.avg_pool(x)
+
+        # print(y.shape,y.squeeze(-1).shape,y.squeeze(-1).transpose(-1, -2).shape)
+        # Two different branches of ECA module
+        # 50*C*1*1
+        #50*C*1
+        #50*1*C
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+
+        # Multi-scale information fusion
+        y = self.sigmoid(y)
+
+        return x * y.expand_as(x)
+    
+    
+# SK注意力机制
+class SK(nn.Module):
+
+    def __init__(self, channel=512,kernels=[1,3,5,7],reduction=16,group=1,L=32):
+        super().__init__()
+        self.d=max(L,channel//reduction)
+        self.convs=nn.ModuleList([])
+        for k in kernels:
+            self.convs.append(
+                nn.Sequential(OrderedDict([
+                    ('conv',nn.Conv2d(channel,channel,kernel_size=k,padding=k//2,groups=group)),
+                    ('bn',nn.BatchNorm2d(channel)),
+                    ('relu',nn.ReLU())
+                ]))
+            )
+        self.fc=nn.Linear(channel,self.d)
+        self.fcs=nn.ModuleList([])
+        for i in range(len(kernels)):
+            self.fcs.append(nn.Linear(self.d,channel))
+        self.softmax=nn.Softmax(dim=0)
+
+    def forward(self, x):
+        bs, c, _, _ = x.size()
+        conv_outs=[]
+        ### split
+        for conv in self.convs:
+            conv_outs.append(conv(x))
+        feats=torch.stack(conv_outs,0)#k,bs,channel,h,w
+
+        ### fuse
+        U=sum(conv_outs) #bs,c,h,w
+
+        ### reduction channel
+        S=U.mean(-1).mean(-1) #bs,c
+        Z=self.fc(S) #bs,d
+
+        ### calculate attention weight
+        weights=[]
+        for fc in self.fcs:
+            weight=fc(Z)
+            weights.append(weight.view(bs,c,1,1)) #bs,channel
+        attention_weughts=torch.stack(weights,0)#k,bs,channel,1,1
+        attention_weughts=self.softmax(attention_weughts)#k,bs,channel,1,1
+
+        ### fuse
+        V=(attention_weughts*feats).sum(0)
+        return V
+
+
+# 处于Conv和Bottleneck之间的CA，这是新CA，没有替换Bottleneck
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+class CABlock(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CABlock, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, inp // reduction)
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        #c*1*W
+        x_h = self.pool_h(x)
+        #c*H*1
+        #C*1*h
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        #C*1*(h+w)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        out = identity * a_w * a_h
+        return out
+
+
+class ConvCAC3(nn.ModuleDict):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.ca = CABlock(c_, c_)       # CA Attenion
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m((self.cv1(x) + self.ca(self.cv1(x)))), self.cv2(x)), 1))
+
+    
+# 处于Conv和Bottleneck之间的SE，这是新C3SE，没有替换Bottleneck
+class ConvSEC3(nn.ModuleDict):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.se = SE(c_, c_)       # SE Attenion
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m((self.cv1(x) + self.se(self.cv1(x)))), self.cv2(x)), 1))
+
+
+# 处于Conv和Bottleneck之间的CBAM，这是新C3CBAM，没有替换Bottleneck
+class ConvCBAMC3(nn.ModuleDict):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.cbam = CBAM(c_, c_)       # SE Attenion
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m((self.cv1(x) + self.cbam(self.cv1(x)))), self.cv2(x)), 1))
+    
+
+# 处于Conv和Bottleneck之间的ECA，这是新C3ECA，没有替换Bottleneck
+class ConvECAC3(nn.ModuleDict):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.eca = ECA(c_, c_)       # ECA Attenion
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m((self.cv1(x) + self.eca(self.cv1(x)))), self.cv2(x)), 1))
+
+# SA 注意力机制
+class SA(nn.Module):
+
+    def __init__(self, channel=512,reduction=16,G=8):
+        super().__init__()
+        self.G=G
+        self.channel=channel
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.gn = nn.GroupNorm(channel // (2 * G), channel // (2 * G))
+        self.cweight = Parameter(torch.zeros(1, channel // (2 * G), 1, 1))
+        self.cbias = Parameter(torch.ones(1, channel // (2 * G), 1, 1))
+        self.sweight = Parameter(torch.zeros(1, channel // (2 * G), 1, 1))
+        self.sbias = Parameter(torch.ones(1, channel // (2 * G), 1, 1))
+        self.sigmoid=nn.Sigmoid()
+
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+
+    @staticmethod
+    def channel_shuffle(x, groups):
+        b, c, h, w = x.shape
+        x = x.reshape(b, groups, -1, h, w)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        # flatten
+        x = x.reshape(b, -1, h, w)
+
+        return x
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        #group into subfeatures
+        x=x.view(b*self.G,-1,h,w) #bs*G,c//G,h,w
+
+        #channel_split
+        x_0,x_1=x.chunk(2,dim=1) #bs*G,c//(2*G),h,w
+
+        #channel attention
+        x_channel=self.avg_pool(x_0) #bs*G,c//(2*G),1,1
+        x_channel=self.cweight*x_channel+self.cbias #bs*G,c//(2*G),1,1
+        x_channel=x_0*self.sigmoid(x_channel)
+
+        #spatial attention
+        x_spatial=self.gn(x_1) #bs*G,c//(2*G),h,w
+        x_spatial=self.sweight*x_spatial+self.sbias #bs*G,c//(2*G),h,w
+        x_spatial=x_1*self.sigmoid(x_spatial) #bs*G,c//(2*G),h,w
+
+        # concatenate along channel axis
+        out=torch.cat([x_channel,x_spatial],dim=1)  #bs*G,c//G,h,w
+        out=out.contiguous().view(b,-1,h,w)
+
+        # channel shuffle
+        out = self.channel_shuffle(out, 2)
+        return out
+
+# 处于Conv和Bottleneck之间的SA，这是新C3SA，没有替换Bottleneck
+class ConvSAC3(nn.ModuleDict):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.sa = SA(c_, c_)       # ECA Attenion
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m((self.cv1(x) + self.sa(self.cv1(x)))), self.cv2(x)), 1))
+
+
+# CARAFE上采样算子用于替换Upsample
+class CARAFE(nn.Module):     
+    #CARAFE: Content-Aware ReAssembly of FEatures       https://arxiv.org/pdf/1905.02188.pdf
+    def __init__(self, c1, c2, kernel_size=3, up_factor=2):
+        super(CARAFE, self).__init__()
+        self.kernel_size = kernel_size
+        self.up_factor = up_factor
+        self.down = nn.Conv2d(c1, c1 // 4, 1)
+        self.encoder = nn.Conv2d(c1 // 4, self.up_factor ** 2 * self.kernel_size ** 2,
+                                 self.kernel_size, 1, self.kernel_size // 2)
+        self.out = nn.Conv2d(c1, c2, 1)
+
+    def forward(self, x):
+        N, C, H, W = x.size()
+        # N,C,H,W -> N,C,delta*H,delta*W
+        # kernel prediction module
+        kernel_tensor = self.down(x)  # (N, Cm, H, W)
+        kernel_tensor = self.encoder(kernel_tensor)  # (N, S^2 * Kup^2, H, W)
+        kernel_tensor = F.pixel_shuffle(kernel_tensor, self.up_factor)  # (N, S^2 * Kup^2, H, W)->(N, Kup^2, S*H, S*W)
+        kernel_tensor = F.softmax(kernel_tensor, dim=1)  # (N, Kup^2, S*H, S*W)
+        kernel_tensor = kernel_tensor.unfold(2, self.up_factor, step=self.up_factor) # (N, Kup^2, H, W*S, S)
+        kernel_tensor = kernel_tensor.unfold(3, self.up_factor, step=self.up_factor) # (N, Kup^2, H, W, S, S)
+        kernel_tensor = kernel_tensor.reshape(N, self.kernel_size ** 2, H, W, self.up_factor ** 2) # (N, Kup^2, H, W, S^2)
+        kernel_tensor = kernel_tensor.permute(0, 2, 3, 1, 4)  # (N, H, W, Kup^2, S^2)
+
+        # content-aware reassembly module
+        # tensor.unfold: dim, size, step
+        x = F.pad(x, pad=(self.kernel_size // 2, self.kernel_size // 2,
+                                          self.kernel_size // 2, self.kernel_size // 2),
+                          mode='constant', value=0) # (N, C, H+Kup//2+Kup//2, W+Kup//2+Kup//2)
+        x = x.unfold(2, self.kernel_size, step=1) # (N, C, H, W+Kup//2+Kup//2, Kup)
+        x = x.unfold(3, self.kernel_size, step=1) # (N, C, H, W, Kup, Kup)
+        x = x.reshape(N, C, H, W, -1) # (N, C, H, W, Kup^2)
+        x = x.permute(0, 2, 3, 1, 4)  # (N, H, W, C, Kup^2)
+
+        out_tensor = torch.matmul(x, kernel_tensor)  # (N, H, W, C, S^2)
+        out_tensor = out_tensor.reshape(N, H, W, -1)
+        out_tensor = out_tensor.permute(0, 3, 1, 2)
+        out_tensor = F.pixel_shuffle(out_tensor, self.up_factor)
+        out_tensor = self.out(out_tensor)
+        #print("up shape:",out_tensor.shape)
+        return out_tensor
+
+
+# C3SE 替换Bottleneck为SEBottleneck
 class SEBottleneck(nn.Module):
     # Standard bottleneck
     def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=16):  # ch_in, ch_out, shortcut, groups, expansion
@@ -890,7 +1276,7 @@ class SEBottleneck(nn.Module):
         # out=self.se(x1)*x1
         return x + out if self.add else out
 
-# C3SE Start
+
 class C3SE(C3):
     # C3 module with SEBottleneck()
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
@@ -898,4 +1284,506 @@ class C3SE(C3):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(SEBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
-"""    C3SE End    """
+
+# C3CBAM 替换Bottleneck为CBAMBottleneck
+class CBAMBottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5,ratio=16,kernel_size=7):  # ch_in, ch_out, shortcut, groups, expansion
+        super(CBAMBottleneck,self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        self.channel_attention = ChannelAttention(c2, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+        #self.cbam=CBAM(c1,c2,ratio,kernel_size)
+
+    def forward(self, x):
+        x1 = self.cv2(self.cv1(x))
+        out = self.channel_attention(x1) * x1
+        # print('outchannels:{}'.format(out.shape))
+        out = self.spatial_attention(out) * out
+        return x + out if self.add else out
+
+
+class C3CBAM(C3):
+    # C3 module with CBAMBottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(CBAMBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+# C3ECA 替换Bottleneck为ECABottleneck
+class ECABottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=16, k_size=3):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        # self.eca=ECA(c1,c2)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x1 = self.cv2(self.cv1(x))
+        # out=self.eca(x1)*x1
+        y = self.avg_pool(x1)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        out = x1 * y.expand_as(x1)
+
+        return x + out if self.add else out
+
+
+class C3ECA(C3):
+    # C3 module with ECABottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(ECABottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+# C3CA 替换Bottleneck为CABottleneck
+class CABottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=32):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        # self.ca=CoordAtt(c1,c2,ratio)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, c1 // ratio)
+        self.conv1 = nn.Conv2d(c1, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        self.conv_h = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
+        
+    def forward(self, x):
+        x1=self.cv2(self.cv1(x))
+        n, c, h, w = x.size()
+        # c*1*W
+        x_h = self.pool_h(x1)
+        # c*H*1
+        # C*1*h
+        x_w = self.pool_w(x1).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        # C*1*(h+w)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        out = x1 * a_w * a_h
+
+        # out=self.ca(x1)*x1
+        return x + out if self.add else out
+
+
+class C3CA(C3):
+    # C3 module with CABottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(CABottleneck(c_, c_,shortcut, g, e=1.0) for _ in range(n)))
+
+
+# C3SA 替换Bottleneck为SABottleneck
+class SABottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=16, G=8):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        self.sa = SA(c2)
+
+    def forward(self, x):
+        x1=self.cv2(self.cv1(x))
+        out = self.sa(x1)
+        return out
+
+
+class C3SA(C3):
+    # C3 module with SABottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(SABottleneck(c_, c_,shortcut, g, e=1.0) for _ in range(n)))
+        
+
+# SKC3 替换Bottleneck为SKBottleneck
+class SKBottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, kernels=[1,3,5,7],reduction=16, L=32):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        self.d=max(L,c2//reduction)
+        self.convs=nn.ModuleList([])
+        for k in kernels:
+            self.convs.append(
+                nn.Sequential(OrderedDict([
+                    ('conv',nn.Conv2d(c2,c2,kernel_size=k,padding=k//2,groups=g)),
+                    ('bn',nn.BatchNorm2d(c2)),
+                    ('relu',nn.ReLU())
+                ]))
+            )
+        self.fc=nn.Linear(c2,self.d)
+        self.fcs=nn.ModuleList([])
+        for i in range(len(kernels)):
+            self.fcs.append(nn.Linear(self.d,c2))
+        self.softmax=nn.Softmax(dim=0)
+
+
+
+    def forward(self, x):
+        x1=self.cv2(self.cv1(x))
+        bs, c, _, _ = x1.size()
+        conv_outs=[]
+        ### split
+        for conv in self.convs:
+            conv_outs.append(conv(x1))
+        feats=torch.stack(conv_outs,0)#k,bs,channel,h,w
+
+        ### fuse
+        U=sum(conv_outs) #bs,c,h,w
+
+        ### reduction channel
+        S=U.mean(-1).mean(-1) #bs,c
+        Z=self.fc(S) #bs,d
+
+        ### calculate attention weight
+        weights=[]
+        for fc in self.fcs:
+            weight=fc(Z)
+            weights.append(weight.view(bs,c,1,1)) #bs,channel
+        attention_weughts=torch.stack(weights,0)#k,bs,channel,1,1
+        attention_weughts=self.softmax(attention_weughts)#k,bs,channel,1,1
+
+        ### fuse
+        V=(attention_weughts*feats).sum(0)
+        return V
+
+    
+class C3SK(C3):
+    # C3 module with SKBottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(SKBottleneck(c_, c_,shortcut, g, e=1.0) for _ in range(n)))
+
+
+# LC Block start
+class CBH(nn.Module):
+    def __init__(self, num_channels, num_filters, filter_size, stride, num_groups=1):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            num_channels,
+            num_filters,
+            filter_size,
+            stride,
+            padding=(filter_size - 1) // 2,
+            groups=num_groups,
+            bias=False)
+        self.bn = nn.BatchNorm2d(num_filters)
+        self.hardswish = nn.Hardswish()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.hardswish(x)
+        return x
+
+    def fuseforward(self, x):
+        return self.hardswish(self.conv(x))
+
+
+class LC_SEModule(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1 = nn.Conv2d(
+            in_channels=channel,
+            out_channels=channel // reduction,
+            kernel_size=1,
+            stride=1,
+            padding=0)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(
+            in_channels=channel // reduction,
+            out_channels=channel,
+            kernel_size=1,
+            stride=1,
+            padding=0)
+        self.SiLU = nn.SiLU()
+        # self.hardsigmoid = nn.Hardsigmoid()
+
+    def forward(self, x):
+        identity = x
+        x = self.avg_pool(x)
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        # x = self.hardsigmoid(x)
+        x = self.SiLU(x)
+        out = identity * x
+        return out
+
+
+class LC_Block(nn.Module):
+    def __init__(self, num_channels, num_filters, stride, dw_size, use_se=False):
+        super().__init__()
+        self.use_se = use_se
+        self.dw_conv = CBH(
+            num_channels=num_channels,
+            num_filters=num_channels,
+            filter_size=dw_size,
+            stride=stride,
+            num_groups=num_channels)
+        if use_se:
+            self.se = LC_SEModule(num_channels)
+        self.pw_conv = CBH(
+            num_channels=num_channels,
+            filter_size=1,
+            num_filters=num_filters,
+            stride=1)
+
+    def forward(self, x):
+        x = self.dw_conv(x)
+        if self.use_se:
+            x = self.se(x)
+        x = self.pw_conv(x)
+        return x
+
+
+class Dense(nn.Module):
+    def __init__(self, num_channels, num_filters, filter_size, dropout_prob):
+        super().__init__()
+        # self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.dense_conv = nn.Conv2d(
+            in_channels=num_channels,
+            out_channels=num_filters,
+            kernel_size=filter_size,
+            stride=1,
+            padding=0,
+            bias=False)
+        self.hardswish = nn.Hardswish()
+        self.dropout = nn.Dropout(p=dropout_prob)
+        # self.flatten = nn.Flatten(start_dim=1, end_dim=-1)
+        # self.fc = nn.Linear(num_filters, num_filters)
+
+    def forward(self, x):
+        # x = self.avg_pool(x)
+        # b, _, w, h = x.shape
+        x = self.dense_conv(x)
+        # b, _, w, h = x.shape
+        x = self.hardswish(x)
+        x = self.dropout(x)
+        # x = self.flatten(x)
+        # x = self.fc(x)
+        # x = x.reshape(b, self.c2, w, h)
+        return x
+    
+    
+# LC Block end
+    
+    
+# GSConv
+#====================================GSConv===========================================
+class GSConv(nn.Module):
+    # GSConv https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        super().__init__()
+        c_ = c2 // 2
+        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+        
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+        # shuffle
+        b, n, h, w = x2.data.size()
+        b_n = b * n // 2
+        y = x2.reshape(b_n, 2, h * w)
+        y = y.permute(1, 0, 2)
+        y = y.reshape(2, -1, n // 2, h, w)
+        return torch.cat((y[0], y[1]), 1)
+    
+    
+class GSBottleneck(nn.Module):
+    # GS Bottleneck https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, k=3, s=1):
+        super().__init__()
+        c_ = c2 // 2
+        # for lighting
+        self.conv_lighting = nn.Sequential(
+            GSConv(c1, c_, 1, 1),
+            GSConv(c_, c2, 1, 1, act=False))
+        # for receptive field
+        self.conv = nn.Sequential(
+            GSConv(c1, c_, 3, 1),
+            GSConv(c_, c2, 3, 1, act=False))
+        self.shortcut = nn.Identity()
+ 
+    def forward(self, x):
+        return self.conv_lighting(x)
+ 
+ 
+class GSBottleneck2(GSBottleneck):
+    # GS Bottleneck https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, k=3, s=1):
+        super().__init__(c1, c2, k, s)
+ 
+    def forward(self, x):
+        return self.conv(x) + self.shortcut(x)
+ 
+ 
+class VoVGSCSP(nn.Module):
+    # VoV-GSCSP https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(2 * c_, c2, 1)
+        self.m = nn.Sequential(*(GSBottleneck(c_, c_) for _ in range(n)))
+ 
+    def forward(self, x):
+        x1 = self.cv1(x)
+        return self.cv2(torch.cat((self.m(x1), x1), dim=1))
+ 
+ 
+class VoVGSCSP2(VoVGSCSP):
+    # VoV-GSCSP2 https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n=1, shortcut=True, g=1, e=0.5)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(GSBottleneck2(c_, c_) for _ in range(n)))
+#============================================END=========================================
+
+
+#============================================SimAM=========================================
+class SimAM(torch.nn.Module):
+    def __init__(self, channels = None,out_channels = None, e_lambda = 1e-4):
+        super(SimAM, self).__init__()
+
+        self.activaton = nn.Sigmoid()
+        self.e_lambda = e_lambda
+
+    def __repr__(self):
+        s = self.__class__.__name__ + '('
+        s += ('lambda=%f)' % self.e_lambda)
+        return s
+
+    @staticmethod
+    def get_module_name():
+        return "simam"
+
+    def forward(self, x):
+
+        b, c, h, w = x.size()
+        
+        n = w * h - 1
+
+        x_minus_mu_square = (x - x.mean(dim=[2,3], keepdim=True)).pow(2)
+        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2,3], keepdim=True) / n + self.e_lambda)) + 0.5
+
+        return x * self.activaton(y)
+#============================================END=========================================
+    
+
+# build shuffle block
+# -------------------------------------------------------------------------
+
+def channel_shuffle(x, groups):
+    batchsize, num_channels, height, width = x.data.size()
+    channels_per_group = num_channels // groups
+
+    # reshape
+    x = x.view(batchsize, groups,
+               channels_per_group, height, width)
+
+    x = torch.transpose(x, 1, 2).contiguous()
+
+    # flatten
+    x = x.view(batchsize, -1, height, width)
+
+    return x
+
+
+class conv_bn_relu_maxpool(nn.Module):
+    def __init__(self, c1, c2):  # ch_in, ch_out
+        super(conv_bn_relu_maxpool, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True),
+        )
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+
+    def forward(self, x):
+        return self.maxpool(self.conv(x))
+
+
+class Shuffle_Block(nn.Module):
+    def __init__(self, inp, oup, stride):
+        super(Shuffle_Block, self).__init__()
+
+        if not (1 <= stride <= 3):
+            raise ValueError('illegal stride value')
+        self.stride = stride
+
+        branch_features = oup // 2
+        assert (self.stride != 1) or (inp == branch_features << 1)
+
+        if self.stride > 1:
+            self.branch1 = nn.Sequential(
+                self.depthwise_conv(inp, inp, kernel_size=3, stride=self.stride, padding=1),
+                nn.BatchNorm2d(inp),
+                nn.Conv2d(inp, branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(branch_features),
+                nn.ReLU(inplace=True),
+            )
+
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(inp if (self.stride > 1) else branch_features,
+                      branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(branch_features),
+            nn.ReLU(inplace=True),
+            self.depthwise_conv(branch_features, branch_features, kernel_size=3, stride=self.stride, padding=1),
+            nn.BatchNorm2d(branch_features),
+            nn.Conv2d(branch_features, branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(branch_features),
+            nn.ReLU(inplace=True),
+        )
+
+    @staticmethod
+    def depthwise_conv(i, o, kernel_size, stride=1, padding=0, bias=False):
+        return nn.Conv2d(i, o, kernel_size, stride, padding, bias=bias, groups=i)
+
+    def forward(self, x):
+        if self.stride == 1:
+            x1, x2 = x.chunk(2, dim=1)
+            out = torch.cat((x1, self.branch2(x2)), dim=1)
+        else:
+            out = torch.cat((self.branch1(x), self.branch2(x)), dim=1)
+
+        out = channel_shuffle(out, 2)
+
+        return out
+
+
+# shuffle block end
+# -------------------------------------------------------------------------
