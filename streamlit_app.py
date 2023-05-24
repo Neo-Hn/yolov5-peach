@@ -34,7 +34,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str,
-                        default='weights/YOLOv5n-Shufflev2-GSConv-CARAFE-C3Ghost-SimAM-Head-ELoss-Mosaic-MixUp.pt', help='model.pt path(s)')
+                        default='weights/orange.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str,
                         default='data/images', help='source')
     parser.add_argument('--imgsz', type=int, default=640,
