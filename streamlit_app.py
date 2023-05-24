@@ -30,7 +30,7 @@ def get_detection_folder():
 
 if __name__ == '__main__':
 
-    st.title('桃子检测器')
+    st.title('橘子检测器')
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str,
